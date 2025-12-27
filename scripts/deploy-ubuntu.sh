@@ -13,7 +13,7 @@ cd "$STACK_DIR" || fail "Must run under $STACK_DIR (cannot cd)."
 
 command -v git >/dev/null 2>&1 || fail "git not found"
 command -v docker >/dev/null 2>&1 || fail "docker not found"
-docker compose version >/dev/null 2>&1 || fail "docker compose not available (try installing Docker Compose v2)"
+docker compose version >/dev/null 2>&1 || fail "docker compose not available (need Docker Compose v2)"
 
 [[ -d .git ]] || fail "$STACK_DIR is not a git repo"
 
@@ -46,93 +46,73 @@ TEST_API_KEY="${TEST_API_KEY:-}"
 if [[ -z "$PORT" ]]; then
   PORT="$(read_dotenv_value "PORT" ".env" || true)"
 fi
-if [[ -z "$PORT" ]]; then
-  PORT="3002"
-fi
+[[ -n "$PORT" ]] || PORT="3002"
 
 if [[ -z "$TEST_API_KEY" ]]; then
   TEST_API_KEY="$(read_dotenv_value "TEST_API_KEY" ".env" || true)"
 fi
 
-API_URL="http://127.0.0.1:${PORT}/v2/crawl"
+API_ROOT="http://127.0.0.1:${PORT}"
+ENDPOINT="/v2/crawl"
 BODY='{"url":"https://docs.firecrawl.dev"}'
 
-echo "==> Self-check: POST /v2/crawl"
-resp="$(curl -sS -m 60 -X POST "$API_URL" -H 'Content-Type: application/json' -d "$BODY" || true)"
+echo "==> Self-check: POST ${ENDPOINT} (wait until API is ready)"
 
-# If unauthorized and we have a key, retry with Authorization header
-if echo "$resp" | grep -q '"status"[[:space:]]*:[[:space:]]*401\|"Unauthorized"\|"unauthorized"'; then
-  if [[ -n "$TEST_API_KEY" ]]; then
-    resp="$(curl -sS -m 60 -X POST "$API_URL" -H 'Content-Type: application/json' -H "Authorization: Bearer ${TEST_API_KEY}" -d "$BODY")"
-  else
-    fail "Self-check unauthorized and no TEST_API_KEY provided (set env TEST_API_KEY or add it to .env)."
+resp=""
+for i in $(seq 1 30); do
+  echo "  - waiting api... try=$i"
+
+  # 先不带鉴权试一次（大多数情况下够用）
+  resp="$(curl -sS -m 10 -X POST "${API_ROOT}${ENDPOINT}" \
+    -H 'Content-Type: application/json' \
+    -d "$BODY" 2>/dev/null || true)"
+
+  # 如果返回的不是 JSON，就继续等（常见于刚启动时 connection reset / empty）
+  if ! echo "$resp" | grep -q '^{'; then
+    resp=""
+    sleep 2
+    continue
   fi
-fi
+
+  # 如果 401 且你有 key，就带 Bearer 再试一次
+  if echo "$resp" | grep -q '"status"[[:space:]]*:[[:space:]]*401\|"Unauthorized"\|"unauthorized"'; then
+    if [[ -n "$TEST_API_KEY" ]]; then
+      resp="$(curl -sS -m 10 -X POST "${API_ROOT}${ENDPOINT}" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${TEST_API_KEY}" \
+        -d "$BODY" 2>/dev/null || true)"
+    fi
+  fi
+
+  # 有 JSON 就交给 python 校验；校验通过就退出循环
+  if python3 - <<'PY' "$resp" >/dev/null 2>&1; then
+import json, sys
+data = json.loads(sys.argv[1])
+ok = bool(data.get("success")) and bool(data.get("id") or (data.get("data") or {}).get("id"))
+sys.exit(0 if ok else 1)
+PY
+    break
+  fi
+
+  resp=""
+  sleep 2
+done
+
+[[ -n "$resp" ]] || fail "API not ready after waiting (no valid JSON success response)."
 
 python3 - <<'PY' "$resp"
 import json, sys
 raw = sys.argv[1]
-try:
-  data = json.loads(raw)
-except Exception:
-  sys.stderr.write("ERROR: Self-check did not return valid JSON.\n")
-  sys.stderr.write(raw + "\n")
-  sys.exit(1)
+data = json.loads(raw)
 
 success = data.get("success")
-crawl_id = data.get("id") or data.get("data", {}).get("id")
+crawl_id = data.get("id") or (data.get("data") or {}).get("id")
+
 if success is not True or not crawl_id:
   sys.stderr.write("ERROR: Self-check failed.\n")
   sys.stderr.write(json.dumps(data, ensure_ascii=False) + "\n")
   sys.exit(1)
 
 print(f"success={str(success).lower()} id={crawl_id}")
-PY
-echo "==> Self-check (proxy): POST /v2/crawl via reverse proxy (optional)"
-
-# 你当前的统一入口（后续如果换域名/端口，只改这里或用环境变量覆盖）
-EXPECTED_BASE="${EXPECTED_BASE:-https://firecrawl.pangkaihome.vip:30443}"
-PROXY_API_URL="${PROXY_API_URL:-${EXPECTED_BASE}/v2/crawl}"
-
-proxy_resp="$(curl -sk -m 60 -X POST "$PROXY_API_URL" \
-  -H 'Content-Type: application/json' \
-  -d "$BODY" || true)"
-
-# 如果反代也返回了 unauthorized，且你提供了 TEST_API_KEY，则带 Bearer 再试一次（兼容未来你加鉴权）
-if echo "$proxy_resp" | grep -q '"status"[[:space:]]*:[[:space:]]*401\|"Unauthorized"\|"unauthorized"'; then
-  if [[ -n "${TEST_API_KEY:-}" ]]; then
-    proxy_resp="$(curl -sk -m 60 -X POST "$PROXY_API_URL" \
-      -H 'Content-Type: application/json' \
-      -H "Authorization: Bearer ${TEST_API_KEY}" \
-      -d "$BODY")"
-  else
-    echo "[healthcheck][WARN] Proxy self-check unauthorized and no TEST_API_KEY provided; skipping proxy URL check."
-    proxy_resp=""
-  fi
-fi
-
-if [[ -n "$proxy_resp" ]]; then
-  python3 - <<'PY' "$proxy_resp" "$EXPECTED_BASE"
-import json, sys
-raw = sys.argv[1]
-expected = sys.argv[2].rstrip("/")
-
-try:
-  data = json.loads(raw)
-except Exception:
-  print("[healthcheck][WARN] Proxy self-check did not return valid JSON (skipping).")
-  sys.exit(0)
-
-url = data.get("url") or ""
-if not url:
-  print("[healthcheck][WARN] Proxy self-check JSON has no 'url' field (skipping).")
-  sys.exit(0)
-
-if url.startswith(expected + "/"):
-  print(f"[healthcheck][OK] proxy url base correct: {url}")
-else:
-  print("[healthcheck][WARN] proxy url base mismatch")
-  print(f"  expected prefix: {expected}/")
-  print(f"  got: {url}")
 PY
 fi
