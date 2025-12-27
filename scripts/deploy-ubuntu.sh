@@ -88,3 +88,51 @@ if success is not True or not crawl_id:
 
 print(f"success={str(success).lower()} id={crawl_id}")
 PY
+echo "==> Self-check (proxy): POST /v2/crawl via reverse proxy (optional)"
+
+# 你当前的统一入口（后续如果换域名/端口，只改这里或用环境变量覆盖）
+EXPECTED_BASE="${EXPECTED_BASE:-https://firecrawl.pangkaihome.vip:30443}"
+PROXY_API_URL="${PROXY_API_URL:-${EXPECTED_BASE}/v2/crawl}"
+
+proxy_resp="$(curl -sk -m 60 -X POST "$PROXY_API_URL" \
+  -H 'Content-Type: application/json' \
+  -d "$BODY" || true)"
+
+# 如果反代也返回了 unauthorized，且你提供了 TEST_API_KEY，则带 Bearer 再试一次（兼容未来你加鉴权）
+if echo "$proxy_resp" | grep -q '"status"[[:space:]]*:[[:space:]]*401\|"Unauthorized"\|"unauthorized"'; then
+  if [[ -n "${TEST_API_KEY:-}" ]]; then
+    proxy_resp="$(curl -sk -m 60 -X POST "$PROXY_API_URL" \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer ${TEST_API_KEY}" \
+      -d "$BODY")"
+  else
+    echo "[healthcheck][WARN] Proxy self-check unauthorized and no TEST_API_KEY provided; skipping proxy URL check."
+    proxy_resp=""
+  fi
+fi
+
+if [[ -n "$proxy_resp" ]]; then
+  python3 - <<'PY' "$proxy_resp" "$EXPECTED_BASE"
+import json, sys
+raw = sys.argv[1]
+expected = sys.argv[2].rstrip("/")
+
+try:
+  data = json.loads(raw)
+except Exception:
+  print("[healthcheck][WARN] Proxy self-check did not return valid JSON (skipping).")
+  sys.exit(0)
+
+url = data.get("url") or ""
+if not url:
+  print("[healthcheck][WARN] Proxy self-check JSON has no 'url' field (skipping).")
+  sys.exit(0)
+
+if url.startswith(expected + "/"):
+  print(f"[healthcheck][OK] proxy url base correct: {url}")
+else:
+  print("[healthcheck][WARN] proxy url base mismatch")
+  print(f"  expected prefix: {expected}/")
+  print(f"  got: {url}")
+PY
+fi
